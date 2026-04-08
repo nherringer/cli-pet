@@ -22,6 +22,30 @@ function getAuthenticatedUsername(octokit: Octokit): Promise<string> {
   return octokit.rest.users.getAuthenticated().then((res) => res.data.login);
 }
 
+// Fallback: when payload.commits is absent or empty, count commits via the commits API
+// using the before..head range on the push event's repo and ref.
+async function fetchCommitCountForPushEvent(octokit: Octokit, event: any): Promise<number> {
+  try {
+    const repoFull: string = event.repo?.name;
+    if (!repoFull) return 0;
+    const [owner, repo] = repoFull.split('/');
+    const head: string = event.payload?.head;
+    const before: string = event.payload?.before;
+    if (!head || !before) return 0;
+
+    // Compare before..head to get the exact commits in this push
+    const comparison = await octokit.rest.repos.compareCommits({
+      owner,
+      repo,
+      base: before,
+      head,
+    });
+    return comparison.data.commits.length;
+  } catch {
+    return 0;
+  }
+}
+
 export async function fetchGitHubActivity(username?: string): Promise<GitHubActivity> {
   const token = getGitHubToken();
   if (!token) {
@@ -44,29 +68,40 @@ export async function fetchGitHubActivity(username?: string): Promise<GitHubActi
 
   // Fetch recent events
   const [eventsRes] = await Promise.all([
-    octokit.rest.activity.listPublicEventsForUser({
+    octokit.rest.activity.listEventsForAuthenticatedUser({
       username: user,
       per_page: 100,
-    }).catch(() => ({ data: [] })),
+    }).catch((err) => { console.error('OCTOKIT ERROR:', err); return { data: [] }; }),
   ]);
 
   const events = eventsRes.data;
 
   // Count commits (PushEvents in last 7 days)
+  // If payload.commits is absent or empty, fall back to the compare API
   const pushEvents = events.filter(
     (e: any) => e.type === 'PushEvent' && new Date(e.created_at!) >= oneWeekAgo
   );
-  const recentCommits = pushEvents.reduce(
-    (sum: number, e: any) => sum + (e.payload?.commits?.length || 0), 0
-  );
 
-  // Count today's commits
+  const recentCommits = (await Promise.all(
+    pushEvents.map(async (e: any) => {
+      const inlineCount = e.payload?.commits?.length || 0;
+      if (inlineCount > 0) return inlineCount;
+      return fetchCommitCountForPushEvent(octokit, e);
+    })
+  )).reduce((sum: number, count: number) => sum + count, 0);
+
+  // Count today's commits with same fallback
   const todayPushEvents = events.filter(
     (e: any) => e.type === 'PushEvent' && new Date(e.created_at!) >= oneDayAgo
   );
-  const totalCommitsToday = todayPushEvents.reduce(
-    (sum: number, e: any) => sum + (e.payload?.commits?.length || 0), 0
-  );
+
+  const totalCommitsToday = (await Promise.all(
+    todayPushEvents.map(async (e: any) => {
+      const inlineCount = e.payload?.commits?.length || 0;
+      if (inlineCount > 0) return inlineCount;
+      return fetchCommitCountForPushEvent(octokit, e);
+    })
+  )).reduce((sum: number, count: number) => sum + count, 0);
 
   // Count merged PRs (PullRequestEvent with action=closed and merged)
   const prEvents = events.filter(
